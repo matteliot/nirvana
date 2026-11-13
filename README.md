@@ -31,6 +31,11 @@ Both go through a 4x12 cab sim per channel. Input comes from the left jack.
 | Verse | light blue | blue |
 | Chorus | red | magenta |
 
+## Install
+
+Download [`release/nirvana.endl`](release/nirvana.endl) (on GitHub: open it and click the download button), connect the Endless
+to your computer over USB and copy the file onto the pedal. Nothing needs to be built. To rebuild it from source, see below.
+
 ## Build
 
 ```sh
