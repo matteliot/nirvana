@@ -48,5 +48,5 @@ cargo sim                    # -> target/render/nirvana_demo.wav
 ```
 
 This renders an original power-chord riff at 117 bpm (strums plus muted ghost
-strums) through the same patch code. It goes chorus → verse → chorus → lead
+strums) on a modelled electric guitar (`src/guitar.rs`: exact tuning, pick and humbucker, palm mutes, strums, vibrato and human timing) through the same patch code. It goes chorus → verse → chorus → lead
 boost, then prints the level and stereo width of each section.

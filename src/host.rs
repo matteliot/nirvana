@@ -1,16 +1,19 @@
 //! Host-only demo renderer: `cargo sim [OUT.wav]`.
 //!
-//! Synthesises a Karplus-Strong "guitar" playing an original power-chord riff
-//! at 117 bpm (strums plus muted ghost strums), drives the patch's entry
+//! Plays an original power-chord riff at 117 bpm (strums plus muted ghost
+//! strums) on a modelled electric guitar (see `guitar`: exact tuning, pick and
+//! pickup, strums, vibrato, human timing), drives the patch's entry
 //! points the way the firmware does (128-sample blocks, footswitch events at
 //! set times) and writes a stereo float WAV. Prints per-section level stats
 //! and fails on NaN or clipping.
 
-use crate::abi::*;
+use crate::guitar::{Note, Player};
 use crate::*;
 
 const N: usize = 128;
 const SRU: usize = 48_000;
+/// The modelled guitar into this patch, matched to the level the patch was voiced for.
+const INPUT_TRIM: f32 = 0.6;
 
 const E2: f32 = 82.41;
 const G2: f32 = 98.0;
@@ -24,66 +27,61 @@ const D4: f32 = 293.66;
 const E4: f32 = 329.63;
 
 enum Ev {
-    /// Pluck these notes with this decay per period; `mute` stops whatever
-    /// is still ringing first.
-    Notes(Vec<f32>, f32, bool),
-    /// A muted "chk" strum.
-    Ghost,
+    /// Play these notes, strummed this many seconds apart, releasing what's still ringing.
+    Play(Vec<Note>, f32),
     Press,
     Hold,
 }
 
-struct Ks {
-    buf: Vec<f32>,
-    i: usize,
-    damp: f32,
+fn power(root: f32, vel: f32) -> Vec<Note> {
+    [root, root * 1.4983, root * 2.0].iter().map(|f| Note::new(*f).vel(vel)).collect()
 }
 
-impl Ks {
-    fn tick(&mut self) -> f32 {
-        let n = self.buf.len();
-        let a = self.buf[self.i];
-        let b = self.buf[(self.i + 1) % n];
-        self.buf[self.i] = self.damp * 0.5 * (a + b);
-        self.i = (self.i + 1) % n;
-        a
-    }
-}
-
-fn power(root: f32) -> Vec<f32> {
-    vec![root, root * 1.4983, root * 2.0]
+/// A muted "chk" strum: the fretting hand lies across the strings, so they barely sound.
+fn ghost() -> Vec<Note> {
+    [E2 * 1.03, A2 * 1.03, E3 * 1.03].iter().map(|f| Note::new(*f).vel(0.5).pm().t60(0.04)).collect()
 }
 
 fn score() -> (Vec<(f64, Ev, &'static str)>, f64) {
     let mut ev = vec![];
     let e = 60.0 / 117.0 / 2.0; // eighth note
     let mut t = 0.1;
-    let loud_riff = |ev: &mut Vec<(f64, Ev, &'static str)>, t: &mut f64| {
+    // Small, repeatable timing slop: nobody plays exactly on the grid.
+    let mut seed: u32 = 0x1357_9bdf;
+    let mut slop = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f64 / u32::MAX as f64 * 2.0 - 1.0) * 0.006
+    };
+    let loud_riff = |ev: &mut Vec<(f64, Ev, &'static str)>, t: &mut f64, slop: &mut dyn FnMut() -> f64| {
         for _ in 0..2 {
             for root in [E2, G2, A2, C3] {
                 // hit, hit, ghost, hit
                 for k in 0..4 {
-                    let x = if k == 2 { Ev::Ghost } else { Ev::Notes(power(root), 0.996, true) };
-                    ev.push((*t, x, ""));
+                    let x = if k == 2 { Ev::Play(ghost(), 0.005) } else { Ev::Play(power(root, if k == 0 { 0.95 } else { 0.85 }), 0.008) };
+                    ev.push((*t + slop(), x, ""));
                     *t += e;
                 }
             }
         }
     };
-    loud_riff(&mut ev, &mut t);
+    loud_riff(&mut ev, &mut t, &mut slop);
     ev.push((t, Ev::Press, "verse (clean + chorus pedal)"));
     t += 0.05;
     for _ in 0..2 {
         for pair in [[E3, A3], [E3, A3], [G3, C4], [G3, C4]] {
-            ev.push((t, Ev::Notes(pair.to_vec(), 0.998, true), ""));
+            ev.push((t + slop().abs(), Ev::Play(pair.iter().map(|f| Note::new(*f).vel(0.7)).collect(), 0.01), ""));
             t += 2.0 * e;
         }
     }
     ev.push((t, Ev::Press, "chorus again (loud)"));
-    loud_riff(&mut ev, &mut t);
+    loud_riff(&mut ev, &mut t, &mut slop);
     ev.push((t, Ev::Hold, "lead boost (solo line)"));
     for (n, len) in [(A3, 2.0), (C4, 2.0), (D4, 2.0), (E4, 4.0), (D4, 2.0), (C4, 2.0), (A3, 8.0)] {
-        ev.push((t, Ev::Notes(vec![n], 0.998, true), ""));
+        let note = Note::new(n).vel(0.9);
+        let note = if len >= 4.0 { note.vib() } else { note };
+        ev.push((t + slop(), Ev::Play(vec![note], 0.0), ""));
         t += len * e;
     }
     (ev, t + 0.5)
@@ -102,27 +100,9 @@ pub fn main() {
     }
 
     let (mut events, total_s) = score();
-    events.reverse();
+    events.sort_by(|a, b| b.0.total_cmp(&a.0));
     let total = (total_s * SRU as f64) as usize;
-    let mut voices: Vec<Ks> = vec![];
-    let mut seed: u32 = 0x1234_5678;
-    let mut rnd = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
-        seed as f32 / u32::MAX as f32 * 2.0 - 1.0
-    };
-    let mut pluck = |f: f32, amp: f32, damp: f32| {
-        let n = (SRU as f32 / f).round() as usize;
-        let mut prev = 0.0;
-        let buf = (0..n)
-            .map(|_| {
-                prev = 0.5 * prev + 0.5 * rnd();
-                prev * amp
-            })
-            .collect();
-        Ks { buf, i: 0, damp }
-    };
+    let mut guitar = Player::new();
 
     let mut lo = vec![];
     let mut ro = vec![];
@@ -134,22 +114,8 @@ pub fn main() {
             match e {
                 Ev::Press => unsafe { special_action(&env, ACTION_FOOTSWITCH_PRESS) },
                 Ev::Hold => unsafe { special_action(&env, ACTION_FOOTSWITCH_HOLD) },
-                Ev::Notes(notes, damp, mute) => {
-                    if mute {
-                        voices.iter_mut().for_each(|v| v.damp = 0.6);
-                    }
-                    for f in notes {
-                        voices.push(pluck(f, 0.12, damp));
-                    }
-                }
-                Ev::Ghost => {
-                    voices.iter_mut().for_each(|v| v.damp = 0.6);
-                    for f in [E2, A2, E3] {
-                        voices.push(pluck(f * 1.03, 0.08, 0.55));
-                    }
-                }
+                Ev::Play(notes, strum) => guitar.play(&notes, strum, false),
             }
-            voices.retain(|v| v.damp > 0.9 || v.buf.iter().any(|x| x.abs() > 1e-4));
             if !label.is_empty() {
                 sections.push((t, label));
             }
@@ -157,7 +123,7 @@ pub fn main() {
         let mut l = [0.0f32; N];
         let mut r = [0.0f32; N];
         for x in l.iter_mut() {
-            *x = voices.iter_mut().map(Ks::tick).sum();
+            *x = guitar.tick() * INPUT_TRIM;
         }
         unsafe { update_buffers(&env, l.as_mut_ptr(), r.as_mut_ptr(), N as i32) };
         lo.extend_from_slice(&l);

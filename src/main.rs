@@ -75,6 +75,17 @@ const OUT_TRIM: f32 = 0.3;
 
 // ---------------------------------------------------------------- state
 
+/// The delay lines. They are all zero at rest, so they live in .bss and add
+/// nothing to the patch file; `patch_init` zeroes them before use.
+struct Bufs {
+    clone_line: Delay<512>,
+    dbl_line: Delay<1024>,
+}
+
+impl Bufs {
+    const NEW: Self = Self { clone_line: Delay::NEW, dbl_line: Delay::NEW };
+}
+
 struct Nv {
     ready: bool,
     error: bool,
@@ -113,9 +124,7 @@ struct Nv {
     gate_open: bool,
     comp: f32,
     // modulation
-    clone_line: Delay<512>,
     clone_ph: f32,
-    dbl_line: Delay<1024>,
     dbl_ph_a: f32,
     dbl_ph_b: f32,
     // coefficients
@@ -162,9 +171,7 @@ impl Nv {
         gate: 0.0,
         gate_open: false,
         comp: 1.0,
-        clone_line: Delay::NEW,
         clone_ph: 0.0,
-        dbl_line: Delay::NEW,
         dbl_ph_a: 0.0,
         dbl_ph_b: 0.25,
         c_param: 1.0,
@@ -245,29 +252,29 @@ impl Nv {
 
     /// Verse voice: clean amp with gentle compression, then the chorus pedal (stereo).
     #[inline]
-    fn clean(&mut self, x: f32) -> (f32, f32) {
+    fn clean(&mut self, bf: &mut Bufs, x: f32) -> (f32, f32) {
         let x = self.clean_hp.process(x);
         // Slow peak compressor, then a soft clean-amp edge.
         let a = x.abs() * CLEAN_DRIVE;
         let target = if a > 0.5 { 0.5 / a } else { 1.0 };
         self.comp += (target - self.comp) * if target < self.comp { 0.05 } else { self.c_comp };
         let y = tanh(x * CLEAN_DRIVE * self.comp) * 0.7;
-        self.clone_line.push(y);
+        bf.clone_line.push(y);
         self.clone_ph += CLONE_RATE / SR;
         if self.clone_ph >= 1.0 {
             self.clone_ph -= 1.0;
         }
         // Triangle LFO; the right channel sweeps in the opposite direction.
         let tri = 4.0 * (self.clone_ph - 0.5).abs() - 1.0;
-        let wl = self.clone_line.read(CLONE_BASE + CLONE_DEPTH * tri);
-        let wr = self.clone_line.read(CLONE_BASE - CLONE_DEPTH * tri);
+        let wl = bf.clone_line.read(CLONE_BASE + CLONE_DEPTH * tri);
+        let wr = bf.clone_line.read(CLONE_BASE - CLONE_DEPTH * tri);
         (y + CLONE_MIX * (wl - y), y + CLONE_MIX * (wr - y))
     }
 
     /// The second "take": late, drifting and slightly darker.
     #[inline]
-    fn double(&mut self, d: f32) -> f32 {
-        self.dbl_line.push(d);
+    fn double(&mut self, bf: &mut Bufs, d: f32) -> f32 {
+        bf.dbl_line.push(d);
         self.dbl_ph_a += DOUBLE_RATE_A / SR;
         self.dbl_ph_b += DOUBLE_RATE_B / SR;
         if self.dbl_ph_a >= 1.0 {
@@ -277,11 +284,11 @@ impl Nv {
             self.dbl_ph_b -= 1.0;
         }
         let drift = 0.6 * sin(TAU * self.dbl_ph_a) + 0.4 * sin(TAU * self.dbl_ph_b);
-        self.dbl_lp.process(self.dbl_line.read(DOUBLE_DELAY + DOUBLE_DRIFT * drift))
+        self.dbl_lp.process(bf.dbl_line.read(DOUBLE_DELAY + DOUBLE_DRIFT * drift))
     }
 
     #[inline]
-    fn tick(&mut self, x: f32) -> (f32, f32) {
+    fn tick(&mut self, bf: &mut Bufs, x: f32) -> (f32, f32) {
         self.g_dist += (self.g_dist_t - self.g_dist) * self.c_param;
         self.out_g += (self.out_t - self.out_g) * self.c_param;
         self.tone_s += (self.tone - self.tone_s) * self.c_param;
@@ -301,8 +308,8 @@ impl Nv {
 
         // Both voices always run, so switching is a click-free crossfade.
         let d = self.distortion(x) * self.gate;
-        let dr = self.double(d);
-        let (cl, cr) = self.clean(x);
+        let dr = self.double(bf, d);
+        let (cl, cr) = self.clean(bf, x);
         let quiet = db(VERSE_LEVEL_DB + CLEAN_MAKEUP_DB);
         let m = self.mix;
         let mut l = cl * quiet + (d - cl * quiet) * m;
@@ -344,14 +351,30 @@ fn limit(x: f32) -> f32 {
 
 /// All patch state. The firmware calls every entry point from the audio
 /// thread (SDK: "no need to synchronize").
-struct Global(UnsafeCell<Nv>);
-unsafe impl Sync for Global {}
-static STATE: Global = Global(UnsafeCell::new(Nv::NEW));
+struct Global<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for Global<T> {}
+static STATE: Global<Nv> = Global(UnsafeCell::new(Nv::NEW));
+static BUFS: Global<Bufs> = Global(UnsafeCell::new(Bufs::NEW));
 
 #[allow(clippy::mut_from_ref)]
 fn state() -> &'static mut Nv {
     // SAFETY: single-threaded access from the firmware's audio thread.
     unsafe { &mut *STATE.0.get() }
+}
+
+#[allow(clippy::mut_from_ref)]
+fn bufs() -> &'static mut Bufs {
+    // SAFETY: as `state`.
+    unsafe { &mut *BUFS.0.get() }
+}
+
+/// Zeroes the delay lines in place. The loader should already have cleared
+/// .bss, but nothing promises it, and a NaN left in a feedback loop never
+/// decays. (In place: a zeroed copy would be a stack temporary.)
+fn clear_bufs() {
+    // SAFETY: `Bufs` is only f32 and usize fields, so all-zero bits are a
+    // valid value; single-threaded as `state`.
+    unsafe { core::ptr::write_bytes(BUFS.0.get(), 0, 1) }
 }
 
 // ---------------------------------------------------------------- entry points
@@ -364,6 +387,7 @@ unsafe extern "C" fn patch_init(env: *const PatchEnv) {
     if env.is_null() || unsafe { (*env).abi_version } != PATCH_ABI_VERSION as u32 {
         return;
     }
+    clear_bufs();
     state().init();
 }
 
@@ -374,12 +398,12 @@ unsafe extern "C" fn update_buffers(_: *const PatchEnv, left: *mut f32, right: *
     }
     // SAFETY: the firmware passes two buffers of `samples` floats.
     let (l, r) = unsafe { (core::slice::from_raw_parts_mut(left, n), core::slice::from_raw_parts_mut(right, n)) };
-    let s = state();
+    let (s, bf) = (state(), bufs());
     if !s.ready {
         return 0.0;
     }
     for (a, b) in l.iter_mut().zip(r.iter_mut()) {
-        let (ol, or) = s.tick(*a);
+        let (ol, or) = s.tick(bf, *a);
         *a = ol;
         *b = or;
     }
@@ -518,6 +542,9 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     }
 }
 
+#[cfg(not(target_os = "none"))]
+#[allow(dead_code)] // each demo uses only some of the playing techniques
+mod guitar;
 #[cfg(not(target_os = "none"))]
 mod host;
 
