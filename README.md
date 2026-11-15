@@ -53,5 +53,11 @@ cargo sim                    # -> target/render/nirvana_demo.wav
 ```
 
 This renders an original power-chord riff at 117 bpm (strums plus muted ghost
-strums) on a modelled electric guitar (`src/guitar.rs`: exact tuning, pick and humbucker, palm mutes, strums, vibrato and human timing) through the same patch code. It goes chorus → verse → chorus → lead
+strums) on a modelled electric guitar (`src/pedalkit/guitar.rs`: exact tuning, pick and humbucker, palm mutes, strums, vibrato and human timing) through the same patch code. It goes chorus → verse → chorus → lead
 boost, then prints the level and stereo width of each section.
+
+## Code layout
+
+- `src/nirvana/`: the pedal. `patch.rs` wires it up, `presets.rs` holds every number, and the other files are its blocks.
+- `src/pedalkit/`: shared building blocks (effects, DSP, the Endless ABI, the entry points, the demo renderer). It's a copy of the master in [superPedal](https://github.com/matteliot/superPedal), which also carries this pedal, so don't edit it here.
+- `src/host/`: the `cargo sim` demo (`score.rs` is what it plays).
